@@ -10,6 +10,16 @@ import retro_brain
 
 app = FastAPI(title="Retro AI Backend")
 
+
+class SystemValueRequest(BaseModel):
+    value: int
+
+
+class QueueRequest(BaseModel):
+    label: str
+    type: str = "task"
+    payload: dict | None = None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -32,6 +42,64 @@ class ChatRequest(BaseModel):
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "model": retro_brain.MODEL}
+
+
+@app.get("/api/system")
+def system_status() -> dict[str, Any]:
+    summary = retro_brain.get_system_summary()
+    return {
+        "os": summary.get("os"),
+        "model": summary.get("model"),
+        "cwd": summary.get("cwd"),
+        "memory_file": summary.get("memory_file"),
+        "safe_modes": summary.get("safe_modes", []),
+        "brightness": 78,
+        "volume": 62,
+    }
+
+
+@app.post("/api/brightness")
+def set_brightness(request: SystemValueRequest) -> dict[str, Any]:
+    value = max(0, min(100, int(request.value)))
+    retro_brain.set_screen_brightness(value)
+    return {"brightness": value, "ok": True}
+
+
+@app.post("/api/volume")
+def set_volume(request: SystemValueRequest) -> dict[str, Any]:
+    value = max(0, min(100, int(request.value)))
+    retro_brain.set_system_volume(value)
+    return {"volume": value, "ok": True}
+
+
+@app.get("/api/queue")
+def get_queue() -> dict[str, Any]:
+    memory_data = retro_brain.load_memory()
+    tasks = memory_data.get("tasks", []) or memory_data.get("task_queue", [])
+    return {"items": tasks}
+
+
+@app.post("/api/queue")
+def add_queue_item(request: QueueRequest) -> dict[str, Any]:
+    memory_data = retro_brain.load_memory()
+    task = retro_brain.enqueue_task(memory_data, request.label, request.type, request.payload or {})
+    return {"ok": True, "task": task}
+
+
+@app.post("/api/queue/run")
+def run_queue() -> dict[str, Any]:
+    memory_data = retro_brain.load_memory()
+    result = retro_brain.execute_queued_tasks(memory_data)
+    return {"ok": True, "result": result}
+
+
+@app.post("/api/queue/clear")
+def clear_queue() -> dict[str, Any]:
+    memory_data = retro_brain.load_memory()
+    memory_data["tasks"] = []
+    memory_data["task_queue"] = []
+    retro_brain.save_memory(memory_data)
+    return {"ok": True, "items": []}
 
 
 @app.post("/api/chat")

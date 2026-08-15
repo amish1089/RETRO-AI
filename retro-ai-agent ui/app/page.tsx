@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Activity,
   Archive,
@@ -69,6 +69,41 @@ export default function Page() {
   const [notice, setNotice] = useState('')
   const [confirming, setConfirming] = useState(false)
 
+  useEffect(() => {
+    async function loadSystemStatus() {
+      try {
+        const response = await fetch('http://localhost:8000/api/system')
+        if (!response.ok) return
+        const data = await response.json()
+        if (typeof data.brightness === 'number') setBrightness(data.brightness)
+        if (typeof data.volume === 'number') setVolume(data.volume)
+      } catch (error) {
+        console.error('Unable to load system status', error)
+      }
+    }
+
+    async function loadQueue() {
+      try {
+        const response = await fetch('http://localhost:8000/api/queue')
+        if (!response.ok) return
+        const data = await response.json()
+        const tasks = Array.isArray(data.items) ? data.items : []
+        if (tasks.length > 0) {
+          setQueue(tasks.map((item: any) => ({
+            label: item.label || 'Queued task',
+            detail: item.status || 'Ready to run',
+            icon: FolderOpen,
+          })))
+        }
+      } catch (error) {
+        console.error('Unable to load queue', error)
+      }
+    }
+
+    loadSystemStatus()
+    loadQueue()
+  }, [])
+
   const stats = useMemo(() => [
     { label: 'CPU', value: '18%', detail: '4 cores · 2.4 GHz', icon: Cpu },
     { label: 'MEMORY', value: '6.2 GB', detail: 'of 16 GB available', icon: Gauge },
@@ -116,14 +151,87 @@ export default function Page() {
     window.setTimeout(() => setNotice(''), 2600)
   }
 
-  function runQueueItem(item: QueueItem) {
+  async function runQueueItem(item: QueueItem) {
     if (item.label.includes('Group')) {
       setConfirming(true)
       return
     }
-    setNotice(`${item.label} started`)
-    setQueue((current) => current.filter((entry) => entry.label !== item.label))
+
+    try {
+      const response = await fetch('http://localhost:8000/api/queue/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (response.ok) {
+        setNotice(`${item.label} started`)
+        const refreshed = await fetch('http://localhost:8000/api/queue')
+        if (refreshed.ok) {
+          const data = await refreshed.json()
+          const tasks = Array.isArray(data.items) ? data.items : []
+          setQueue(tasks.map((entry: any) => ({
+            label: entry.label || 'Queued task',
+            detail: entry.status || 'Ready to run',
+            icon: FolderOpen,
+          })))
+        }
+      }
+    } catch (error) {
+      console.error('Queue execution failed', error)
+      setNotice('Queue action failed')
+    }
     window.setTimeout(() => setNotice(''), 2600)
+  }
+
+  async function clearQueue() {
+    try {
+      const response = await fetch('http://localhost:8000/api/queue/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (response.ok) {
+        setQueue([])
+        setNotice('Queue cleared')
+      }
+    } catch (error) {
+      console.error('Unable to clear queue', error)
+      setNotice('Could not clear queue')
+    }
+    window.setTimeout(() => setNotice(''), 2600)
+  }
+
+  async function confirmQueueAction() {
+    try {
+      const response = await fetch('http://localhost:8000/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'Group files in Downloads by type' }),
+      })
+      const data = await response.json()
+      const reply = data.reply || 'Task confirmed.'
+      setMessages((current) => [
+        ...current,
+        { role: 'retro', text: reply, meta: 'NOW · RETRO' },
+      ])
+      setQueue((current) => current.filter((item) => !item.label.includes('Group')))
+      setConfirming(false)
+      setNotice('Files grouping task confirmed')
+    } catch (error) {
+      console.error('Unable to confirm queued action', error)
+      setNotice('Confirmation failed')
+    }
+    window.setTimeout(() => setNotice(''), 2600)
+  }
+
+  async function updateSystemLevel(kind: 'brightness' | 'volume', value: number) {
+    try {
+      await fetch(`http://localhost:8000/api/${kind}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      })
+    } catch (error) {
+      console.error(`Unable to set ${kind}`, error)
+    }
   }
 
   return (
@@ -168,15 +276,15 @@ export default function Page() {
 
           <aside className="right-rail">
             <section className="panel telemetry-panel"><div className="panel-heading compact"><div><span className="section-kicker">SYSTEM TELEMETRY</span><h2>All systems nominal</h2></div><Activity size={18} className="green-icon" /></div><div className="stats-grid">{stats.map(({ label, value, detail, icon: Icon }) => <div className="stat-card" key={label}><div className="stat-label"><Icon size={14} />{label}</div><strong>{value}</strong><span>{detail}</span><div className="stat-bar"><i style={{ width: label === 'CPU' ? '18%' : label === 'MEMORY' ? '58%' : '42%' }} /></div></div>)}</div><div className="status-row"><span><span className="status-dot" /> Core active</span><span className="mono">v0.8.4</span></div></section>
-            <section className="panel controls-panel"><div className="panel-heading compact"><div><span className="section-kicker">QUICK CONTROLS</span><h2>Environment</h2></div><Zap size={18} className="amber-icon" /></div><label className="range-control"><span><span>Brightness</span><strong>{brightness}%</strong></span><input type="range" min="0" max="100" value={brightness} onChange={(event) => setBrightness(Number(event.target.value))} /></label><label className="range-control"><span><span><Volume2 size={14} /> Volume</span><strong>{volume}%</strong></span><input type="range" min="0" max="100" value={volume} onChange={(event) => setVolume(Number(event.target.value))} /></label><div className="toggle-row"><div><ShieldCheck size={16} /><span><strong>Safe mode</strong><small>Ask before risky actions</small></span></div><button className={`toggle ${safeMode ? 'on' : ''}`} onClick={() => setSafeMode(!safeMode)} aria-pressed={safeMode}><span /></button></div></section>
-            <section className="panel queue-panel"><div className="panel-heading compact"><div><span className="section-kicker">TASK QUEUE</span><h2>{queue.length} things in motion</h2></div><button className="text-button" onClick={() => setQueue([])}>Clear all</button></div><div className="queue-list">{queue.length === 0 ? <div className="queue-empty">Queue cleared <Check size={14} /></div> : queue.map((item) => { const Icon = item.icon; return <div className="queue-item" key={item.label}><div className="queue-icon"><Icon size={16} /></div><div><strong>{item.label}</strong><small>{item.detail}</small></div><button className="queue-run" onClick={() => runQueueItem(item)} aria-label={`Run ${item.label}`}><ChevronRight size={16} /></button></div> })}</div></section>
+            <section className="panel controls-panel"><div className="panel-heading compact"><div><span className="section-kicker">QUICK CONTROLS</span><h2>Environment</h2></div><Zap size={18} className="amber-icon" /></div><label className="range-control"><span><span>Brightness</span><strong>{brightness}%</strong></span><input type="range" min="0" max="100" value={brightness} onChange={(event) => { const next = Number(event.target.value); setBrightness(next); void updateSystemLevel('brightness', next); }} /></label><label className="range-control"><span><span><Volume2 size={14} /> Volume</span><strong>{volume}%</strong></span><input type="range" min="0" max="100" value={volume} onChange={(event) => { const next = Number(event.target.value); setVolume(next); void updateSystemLevel('volume', next); }} /></label><div className="toggle-row"><div><ShieldCheck size={16} /><span><strong>Safe mode</strong><small>Ask before risky actions</small></span></div><button className={`toggle ${safeMode ? 'on' : ''}`} onClick={() => setSafeMode(!safeMode)} aria-pressed={safeMode}><span /></button></div></section>
+            <section className="panel queue-panel"><div className="panel-heading compact"><div><span className="section-kicker">TASK QUEUE</span><h2>{queue.length} things in motion</h2></div><button className="text-button" onClick={() => void clearQueue()}>Clear all</button></div><div className="queue-list">{queue.length === 0 ? <div className="queue-empty">Queue cleared <Check size={14} /></div> : queue.map((item) => { const Icon = item.icon; return <div className="queue-item" key={item.label}><div className="queue-icon"><Icon size={16} /></div><div><strong>{item.label}</strong><small>{item.detail}</small></div><button className="queue-run" onClick={() => void runQueueItem(item)} aria-label={`Run ${item.label}`}><ChevronRight size={16} /></button></div> })}</div></section>
           </aside>
         </div>
 
         <footer className="quick-bar"><span className="section-kicker">SUGGESTED</span>{quickActions.map(({ label, icon: Icon }) => <button key={label} onClick={() => sendMessage(label)}><Icon size={14} /> {label}<ArrowUpRight size={12} /></button>)}</footer>
       </section>
       {notice && <div className="toast"><Check size={15} /> {notice}</div>}
-      {confirming && <div className="modal-backdrop" role="presentation"><div className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><button className="modal-close" onClick={() => setConfirming(false)} aria-label="Close"><X size={17} /></button><div className="warning-icon"><ShieldCheck size={22} /></div><span className="section-kicker">CONFIRM ACTION</span><h2 id="confirm-title">Group files in Downloads?</h2><p>Retro will create folders and move 18 items. Nothing will be deleted, but existing folder names may be reused.</p><div className="modal-actions"><button className="secondary-button" onClick={() => setConfirming(false)}>Cancel</button><button className="primary-button" onClick={() => { setConfirming(false); setQueue((current) => current.filter((item) => !item.label.includes('Group'))); setNotice('Files grouped successfully') }}>Continue <ChevronRight size={15} /></button></div></div></div>}
+      {confirming && <div className="modal-backdrop" role="presentation"><div className="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><button className="modal-close" onClick={() => setConfirming(false)} aria-label="Close"><X size={17} /></button><div className="warning-icon"><ShieldCheck size={22} /></div><span className="section-kicker">CONFIRM ACTION</span><h2 id="confirm-title">Group files in Downloads?</h2><p>Retro will create folders and move 18 items. Nothing will be deleted, but existing folder names may be reused.</p><div className="modal-actions"><button className="secondary-button" onClick={() => setConfirming(false)}>Cancel</button><button className="primary-button" onClick={() => void confirmQueueAction()}>Continue <ChevronRight size={15} /></button></div></div></div>}
     </main>
   )
 }
