@@ -75,16 +75,44 @@ export default function Page() {
     { label: 'STORAGE', value: '42%', detail: '118 GB free', icon: HardDrive },
   ], [])
 
-  function sendMessage(value = prompt) {
+  async function sendMessage(value = prompt) {
     const trimmed = value.trim()
     if (!trimmed) return
+
     setMessages((current) => [
       ...current,
       { role: 'user', text: trimmed, meta: 'NOW · YOU' },
-      { role: 'retro', text: `I’m on it. I’ll ${trimmed.toLowerCase().replace(/[.!?]+$/, '')}. I’ll keep you posted as the task moves through the queue.`, meta: 'NOW · RETRO' },
     ])
     setPrompt('')
-    setNotice('Command added to activity stream')
+    setNotice('Processing...')
+
+    try {
+      const response = await fetch('http://localhost:8000/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: trimmed }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Backend request failed')
+      }
+
+      const data = await response.json()
+      const reply = data.reply || 'No response from Retro.'
+
+      setMessages((current) => [
+        ...current,
+        { role: 'retro', text: reply, meta: 'NOW · RETRO' },
+      ])
+      setNotice('Response received')
+    } catch (error) {
+      setMessages((current) => [
+        ...current,
+        { role: 'retro', text: 'Retro backend is unavailable. Please make sure the Python server is running on localhost:8000.', meta: 'NOW · RETRO' },
+      ])
+      setNotice('Backend offline')
+    }
+
     window.setTimeout(() => setNotice(''), 2600)
   }
 
