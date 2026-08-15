@@ -6,7 +6,9 @@ import re
 import os
 import threading
 import time
+import webbrowser
 from pathlib import Path
+from urllib.parse import quote_plus
 
 try:
     import screen_brightness_control as sbc
@@ -28,7 +30,8 @@ except ImportError:
 # 1. CONFIGURATION
 # ==========================================
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "llama3"  # Change to 'phi3' or your preferred local model
+OLLAMA_MODELS_URL = "http://localhost:11434/api/tags"
+MODEL = os.getenv("RETRO_MODEL", "llama3")
 MEMORY_PATH = os.path.join(os.path.expanduser("~"), ".retro_memory.json")
 SAFE_APPS = {
     "notepad",
@@ -57,6 +60,19 @@ DANGEROUS_PATTERNS = [
     "restart",
     "install",
     "uninstall",
+    "rm ",
+    "del ",
+    "rmdir",
+    "mklink",
+]
+CONFIRMATION_REQUIRED_PATTERNS = [
+    "shutdown",
+    "restart",
+    "install",
+    "uninstall",
+    "delete",
+    "format",
+    "remove",
     "rm ",
     "del ",
     "rmdir",
@@ -160,28 +176,153 @@ def build_context(user_input, existing_context=None, memory_data=None):
     return context
 
 
+def normalize_ollama_context(context):
+    """Ollama expects a numeric context array, not the local dict-based app context."""
+    if isinstance(context, list):
+        return context
+    if isinstance(context, tuple):
+        return list(context)
+    return None
+
+
 def recognize_multi_step_task(prompt):
-    """Simple heuristic to detect multi-step prompts."""
-    task_markers = [" and ", " then ", " then do ", " first ", " next ", " afterwards ", " summarize ", " review ", " find ", " compare "]
+    """Detects task chains like 'find X, read Y, and summarize it'."""
+    task_markers = [
+        " and ", " then ", " then do ", " first ", " next ", " afterwards ",
+        " summarize ", " review ", " find ", " compare ", " search ", " open ",
+        " look for ", " before ", " after that "
+    ]
     lower = prompt.lower()
     return any(marker in lower for marker in task_markers) and len(prompt.split()) > 8
 
 
-def plan_task(prompt):
-    """Creates a lightweight plan for multi-step requests."""
-    steps = []
+def extract_search_query(prompt):
+    """Extracts a useful search string from a task prompt."""
     lower = prompt.lower()
-    if "find" in lower or "search" in lower:
-        steps.append("search for relevant files or information")
-    if "summarize" in lower or "summary" in lower:
-        steps.append("summarize the result")
-    if "open" in lower or "launch" in lower:
-        steps.append("open the requested application or page")
-    if "brightness" in lower or "volume" in lower:
-        steps.append("adjust system settings")
+    for marker in ["search for ", "find ", "look for ", "locate "]:
+        idx = lower.find(marker)
+        if idx != -1:
+            remainder = prompt[idx + len(marker):]
+            return remainder.strip(" .?")
+
+    if "about" in lower:
+        idx = lower.find("about ") + len("about ")
+        return prompt[idx:].strip(" .?")
+
+    return prompt.strip(" .? ")
+
+
+def plan_task(prompt):
+    """Creates a structured plan for multi-step requests."""
+    lower = prompt.lower()
+    steps = []
+
+    if any(word in lower for word in ["find ", "search ", "look for ", "locate "]):
+        steps.append({
+            "action": "search_files",
+            "label": "search for relevant files or information",
+            "query": extract_search_query(prompt),
+        })
+
+    if any(word in lower for word in ["read ", "open file", "open the file", "view "]):
+        steps.append({
+            "action": "read_file",
+            "label": "read the most relevant file",
+            "path": "",
+        })
+
+    if any(word in lower for word in ["summarize", "summary", "review"]):
+        steps.append({
+            "action": "summarize",
+            "label": "summarize the result",
+        })
+
+    if any(word in lower for word in ["open ", "launch ", "start "]):
+        app_name = ""
+        for candidate in ["notepad", "calculator", "chrome", "file explorer", "cmd", "powershell", "edge", "spotify", "vscode", "word", "excel"]:
+            if candidate in lower:
+                app_name = candidate
+                break
+        if app_name:
+            steps.append({
+                "action": "open_app",
+                "label": "open the requested application",
+                "command": app_name,
+            })
+
+    if "brightness" in lower:
+        steps.append({
+            "action": "set_brightness",
+            "label": "adjust brightness",
+            "level": 50,
+        })
+
+    if "volume" in lower:
+        steps.append({
+            "action": "set_volume",
+            "label": "adjust volume",
+            "level": 50,
+        })
+
     if not steps:
-        steps = ["handle the user request with the main agent flow"]
+        steps = [{"action": "respond", "label": "handle the user request with the main agent flow"}]
+
     return steps
+
+
+def execute_multi_step_task(prompt, memory_data):
+    """Executes a step-by-step plan for a complex request."""
+    steps = plan_task(prompt)
+    if not steps or steps[0].get("action") == "respond":
+        return None
+
+    results = []
+    search_hits = []
+
+    for step in steps:
+        action = step.get("action")
+
+        if action == "search_files":
+            query = step.get("query") or extract_search_query(prompt)
+            search_hits = search_local_files(query)
+            results.append(f"Search for '{query}' returned {len(search_hits)} result(s).")
+
+        elif action == "read_file":
+            path = step.get("path") or (search_hits[0] if search_hits else os.getcwd())
+            content = read_text_file(path)
+            if isinstance(content, str):
+                results.append(f"Read file: {path}")
+                results.append(content[:400])
+
+        elif action == "open_app":
+            command = step.get("command")
+            if command:
+                execute_system_command(command)
+                results.append(f"Opened: {command}")
+
+        elif action == "set_brightness":
+            level = step.get("level", 50)
+            set_screen_brightness(level)
+            results.append(f"Brightness adjusted to {level}%.")
+
+        elif action == "set_volume":
+            level = step.get("level", 50)
+            set_system_volume(level)
+            results.append(f"Volume adjusted to {level}%.")
+
+        elif action == "summarize":
+            context_text = "\n".join(str(item) for item in results if item)
+            summary_prompt = (
+                f"User request: {prompt}\n\nRelevant findings:\n{context_text}\n\n"
+                "Give a concise summary of the results and what was done."
+            )
+            summary, _ = ask_retro(summary_prompt, build_context(prompt, None, memory_data))
+            return summary
+
+    if not results:
+        return None
+
+    return "I completed the task in this order: " + "; ".join(str(item) for item in results if item)
 
 
 # ==========================================
@@ -190,9 +331,19 @@ def plan_task(prompt):
 def is_safe_command(command):
     """Checks whether a command is allowed or requires confirmation."""
     lowered = command.lower()
-    if any(item in lowered for item in ["shutdown", "restart", "install", "uninstall", "delete", "format", "rm ", "del ", "rmdir"]):
+    if any(item in lowered for item in CONFIRMATION_REQUIRED_PATTERNS):
         return False
     return True
+
+
+def confirm_action(action_description):
+    """Prompts the user to confirm an action that could be risky."""
+    try:
+        answer = input(f"[CONFIRM] {action_description} (y/N): ").strip().lower()
+        return answer in ["y", "yes"]
+    except (EOFError, KeyboardInterrupt):
+        print("\n[CONFIRM] Action cancelled.")
+        return False
 
 
 def execute_system_command(command):
@@ -206,7 +357,9 @@ def execute_system_command(command):
 
     if not is_safe_command(command):
         print(f"[WARN]: Command requires confirmation before execution: {command}")
-        return False
+        if not confirm_action("Execute potentially risky command"):
+            print("[CANCELLED]: Command not executed.")
+            return False
 
     print(f"\n[RETRO SYSTEM EXECUTING]: {command}")
 
@@ -362,22 +515,152 @@ def route_tool_call(tool_name, args):
     return False
 
 
+def get_system_summary():
+    """Returns a compact overview of the current device context."""
+    return {
+        "os": platform.system(),
+        "model": MODEL,
+        "cwd": os.getcwd(),
+        "memory_file": MEMORY_PATH,
+        "safe_modes": ["search", "read", "list_dir", "open_app", "brightness", "volume"],
+    }
+
+
+def open_url(url):
+    """Opens a URL using the OS default browser."""
+    target = (url or "").strip()
+    if not target:
+        return False
+    if not re.match(r"^(https?://|www\.)", target, re.IGNORECASE):
+        target = "https://" + target
+    return execute_system_command(target)
+
+
+def enqueue_task(memory_data, label, task_type, payload=None):
+    """Adds a queued task to memory without disturbing the original logic."""
+    memory_data.setdefault("tasks", [])
+    memory_data.setdefault("task_queue", memory_data["tasks"])
+
+    task = {
+        "label": label,
+        "type": task_type,
+        "payload": payload or {},
+        "status": "pending",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    memory_data["tasks"].append(task)
+    memory_data["task_queue"] = memory_data["tasks"]
+    save_memory(memory_data)
+    return task
+
+
+def execute_queued_tasks(memory_data):
+    """Runs any queued tasks one by one in a simple but fuller task-queue loop."""
+    tasks = memory_data.get("task_queue") or memory_data.get("tasks", [])
+    if not tasks:
+        return "No queued tasks found."
+
+    results = []
+    for task in tasks:
+        task_type = task.get("type")
+        payload = task.get("payload", {})
+        task["status"] = "running"
+
+        if task_type == "search":
+            hits = search_local_files(payload.get("query", ""))
+            results.append(f"Queued task '{task.get('label')}' found {len(hits)} match(es).")
+        elif task_type == "open_app":
+            execute_system_command(payload.get("command", ""))
+            results.append(f"Queued task '{task.get('label')}' launched successfully.")
+        elif task_type == "brightness":
+            set_screen_brightness(payload.get("level", 50))
+            results.append(f"Queued task '{task.get('label')}' adjusted brightness.")
+        elif task_type == "volume":
+            set_system_volume(payload.get("level", 50))
+            results.append(f"Queued task '{task.get('label')}' adjusted volume.")
+        else:
+            results.append(f"Queued task '{task.get('label')}' is pending.")
+
+        task["status"] = "completed"
+
+    memory_data["tasks"] = []
+    memory_data["task_queue"] = []
+    save_memory(memory_data)
+    return " ; ".join(results)
+
+
+def browser_search(query):
+    """Opens a web search in the default browser."""
+    q = quote_plus((query or "").strip())
+    if not q:
+        return False
+    url = "https://www.google.com/search?q=" + q
+    return webbrowser.open(url)
+
+
+def browser_open_url(url):
+    """Opens a site in the default browser without disturbing the original app flow."""
+    target = (url or "").strip()
+    if not target:
+        return False
+    if not re.match(r"^(https?://|www\.)", target, re.IGNORECASE):
+        target = "https://" + target
+    return webbrowser.open(target)
+
+
 # ==========================================
 # 4. LOCAL LLM INTERFACE (The Brain)
 # ==========================================
+def get_available_ollama_models():
+    """Returns available model names from the running Ollama server."""
+    try:
+        response = requests.get(OLLAMA_MODELS_URL, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        models = []
+        for item in data.get("models", []):
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("model")
+                if name:
+                    models.append(name)
+        return models
+    except Exception:
+        return []
+
+
+def resolve_model_name():
+    """Uses the locally available Ollama models to pick a valid one."""
+    global MODEL
+    available = get_available_ollama_models()
+    if not available:
+        return MODEL
+
+    preferred = [MODEL, f"{MODEL}:latest", "llama3", "llama3:latest", "mistral", "phi3:mini"]
+    for candidate in preferred:
+        if candidate in available:
+            MODEL = candidate
+            return MODEL
+
+    MODEL = available[0]
+    return MODEL
+
+
 def ask_retro(prompt, context=None):
     """Sends the prompt to the local Ollama model."""
+    model_name = resolve_model_name()
+    normalized_context = normalize_ollama_context(context)
 
     payload = {
-        "model": MODEL,
+        "model": model_name,
         "prompt": prompt,
         "system": SYSTEM_PROMPT,
         "stream": False,
-        "context": context,
     }
+    if normalized_context is not None:
+        payload["context"] = normalized_context
 
     try:
-        response = requests.post(OLLAMA_URL, json=payload)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
         raw_text = ""
@@ -393,15 +676,22 @@ def ask_retro(prompt, context=None):
                         parts.append(r)
                 raw_text = "\n".join([p for p in parts if p])
 
-            new_context = data.get("context", context)
+            new_context = data.get("context")
+            if not isinstance(new_context, list):
+                new_context = None
         else:
             raw_text = str(data)
-            new_context = context
+            new_context = None
 
         return raw_text, new_context
 
-    except requests.exceptions.RequestException:
-        return "Error: Could not connect to Ollama. Is it running?", context
+    except requests.exceptions.ConnectionError:
+        return "Error: Ollama is not running or not reachable at http://localhost:11434. Start Ollama and try again.", context
+    except requests.exceptions.RequestException as exc:
+        details = str(exc)
+        if "model" in details.lower() or "not found" in details.lower():
+            return f"Error: The selected Ollama model '{model_name}' is unavailable. Available models: {get_available_ollama_models() or 'none'}.", context
+        return f"Error: Ollama request failed: {details}", context
     except Exception as e:
         return f"Error: Unexpected response from Ollama ({e})", context
 
@@ -477,10 +767,46 @@ def handle_agentic_prompt(user_input, memory_data):
     if "who developed you" in lower or "who created you" in lower or "who made you" in lower:
         return "I was developed by Amish."
 
+    if any(term in lower for term in ["what can you do", "what are your capabilities", "list your features", "your features", "capabilities"]):
+        return (
+            "I can help with local file search, file reading and writing, app launching, "
+            "browser URL opening, brightness and volume control, memory, planning, and safe task execution."
+        )
+
+    if "queue" in lower or "schedule" in lower or "run my tasks" in lower:
+        queued = execute_queued_tasks(memory_data)
+        return queued
+
+    if "search the web" in lower or "web search" in lower:
+        query = user_input.split("search the web", 1)[-1].strip() or user_input.split("web search", 1)[-1].strip()
+        browser_search(query)
+        return f"Searching the web for: {query or 'your query'}"
+
+    if "open website" in lower or "open url" in lower or "go to " in lower:
+        match = re.search(r"(?:go to|open website|open url)\s+(https?://\S+|www\.\S+|[A-Za-z0-9.-]+\.[A-Za-z]{2,}\S*)", user_input, re.IGNORECASE)
+        url = match.group(1) if match else ""
+        if url:
+            browser_open_url(url)
+            return f"Opening {url} in the default browser."
+
+    if "system status" in lower or "status" in lower and "system" in lower:
+        return str(get_system_summary())
+
     if recognize_multi_step_task(user_input):
         plan = plan_task(user_input)
         remember_history(memory_data, user_input)
-        return "I have a plan: " + "; ".join(plan)
+
+        executed = execute_multi_step_task(user_input, memory_data)
+        if executed:
+            return executed
+
+        steps = []
+        for item in plan:
+            if isinstance(item, dict):
+                steps.append(item.get("label", "step"))
+            else:
+                steps.append(str(item))
+        return "I have a plan: " + "; ".join(steps)
 
     return None
 
@@ -511,6 +837,8 @@ def main():
 
             # 2. Ask the Local LLM
             raw_response, conversation_context = ask_retro(user_input, conversation_context)
+            if not isinstance(conversation_context, list):
+                conversation_context = None
 
             # 3. Parse for commands and execute them
             final_response = parse_and_act(raw_response)
