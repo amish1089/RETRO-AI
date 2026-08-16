@@ -190,11 +190,95 @@ def recognize_multi_step_task(prompt):
     task_markers = [
         " and ", " then ", " then do ", " first ", " next ", " afterwards ",
         " summarize ", " review ", " find ", " compare ", " search ", " open ",
-        " look for ", " before ", " after that "
+        " look for ", " before ", " after that ", " read ", " write ", " create ",
+        " browse ", " go to "
     ]
     lower = prompt.lower()
-    # Changed from > 8 to > 3 to allow shorter, direct agentic commands
     return any(marker in lower for marker in task_markers) and len(prompt.split()) > 3
+
+
+def extract_app_name(prompt):
+    """Parses common app names from natural language prompts."""
+    lower = (prompt or "").lower()
+    aliases = {
+        "notepad": ["notepad"],
+        "calc": ["calculator", "calc"],
+        "cmd": ["command prompt", "cmd"],
+        "powershell": ["powershell"],
+        "msedge": ["edge", "microsoft edge", "msedge"],
+        "chrome": ["chrome", "google chrome"],
+        "firefox": ["firefox"],
+        "spotify": ["spotify"],
+        "code": ["vscode", "visual studio code", "code"],
+        "word": ["word"],
+        "excel": ["excel"],
+        "outlook": ["outlook"],
+        "explorer": ["file explorer", "explorer"],
+    }
+    for app_name, names in aliases.items():
+        if any(name in lower for name in names):
+            return app_name
+
+    match = re.search(r"(?:open|launch|start|run)\s+(?:the\s+)?([a-z0-9 .\-]+)", lower)
+    if match:
+        candidate = match.group(1).strip()
+        candidate = candidate.replace(" file explorer", "explorer")
+        return candidate if candidate else ""
+    return ""
+
+
+def parse_numeric_level(prompt, default=50):
+    """Pulls a 0-100 value from user prompts such as 'set volume to 70%' or 'brightness 25'."""
+    text = prompt or ""
+    match = re.search(r"(\d{1,3})\s*%?", text)
+    if match:
+        value = int(match.group(1))
+        return max(0, min(100, value))
+    return default
+
+
+def parse_direct_task(prompt):
+    """Parses common agent commands from natural-language input without replacing the original flow."""
+    user_text = (prompt or "").strip()
+    lower = user_text.lower()
+
+    if re.match(r"^(open|launch|start|run)\b", lower):
+        app_name = extract_app_name(user_text)
+        if app_name:
+            return {"action": "open_app", "command": app_name}
+
+    if any(term in lower for term in ["set brightness", "brightness", "screen brightness"]):
+        return {"action": "set_brightness", "level": parse_numeric_level(user_text, 50)}
+
+    if any(term in lower for term in ["set volume", "volume", "sound level"]):
+        return {"action": "set_volume", "level": parse_numeric_level(user_text, 50)}
+
+    if any(term in lower for term in ["search for ", "find ", "look for ", "locate "]):
+        return {"action": "search_files", "query": extract_search_query(user_text)}
+
+    if any(term in lower for term in ["read file ", "read the file ", "open file ", "view file ", "open the file "]):
+        match = re.search(r"(?:read|open|view)\s+(?:the\s+)?(?:file\s+)?(.+)", user_text, re.IGNORECASE)
+        if match:
+            return {"action": "read_file", "path": match.group(1).strip().strip('"\'')}
+
+    if any(term in lower for term in ["write file ", "create file ", "make file "]):
+        match = re.search(r"(?:write|create|make)\s+(?:the\s+)?(?:file\s+)?(?:named\s+)?([\w\- ./]+\.[a-zA-Z0-9]+)\s*(?:with\s+|to\s+)?(.+)?", user_text, re.IGNORECASE)
+        if match:
+            path = match.group(1).strip().strip('"\'')
+            content = (match.group(2) or "").strip()
+            return {"action": "write_file", "path": path, "content": content}
+
+    if any(term in lower for term in ["list directory", "list dir", "show directory", "show files in"]):
+        match = re.search(r"(?:in|for|at)\s+(.+)", user_text, re.IGNORECASE)
+        directory = match.group(1).strip().strip('"\'') if match else os.getcwd()
+        return {"action": "list_dir", "path": directory}
+
+    if any(term in lower for term in ["open website", "open url", "go to "]):
+        match = re.search(r"(?:go to|open website|open url)\s+(https?://\S+|www\.\S+|[A-Za-z0-9.-]+\.[A-Za-z]{2,}\S*)", user_text, re.IGNORECASE)
+        if match:
+            return {"action": "open_url", "url": match.group(1)}
+
+    return None
 
 
 def extract_search_query(prompt):
@@ -246,37 +330,47 @@ def plan_task(prompt):
             "path": "",
         })
 
+    if any(word in lower for word in ["write ", "create file", "make file", "save to file"]):
+        steps.append({
+            "action": "write_file",
+            "label": "write the requested content to a file",
+            "path": "",
+            "content": "",
+        })
+
     if any(word in lower for word in ["summarize", "summary", "review"]):
         steps.append({
             "action": "summarize",
             "label": "summarize the result",
         })
 
-    if any(word in lower for word in ["open ", "launch ", "start "]):
-        app_name = ""
-        for candidate in ["notepad", "calculator", "chrome", "file explorer", "cmd", "powershell", "edge", "spotify", "vscode", "word", "excel"]:
-            if candidate in lower:
-                app_name = candidate
-                break
-        if app_name:
-            steps.append({
-                "action": "open_app",
-                "label": "open the requested application",
-                "command": app_name,
-            })
+    app_name = extract_app_name(prompt)
+    if app_name:
+        steps.append({
+            "action": "open_app",
+            "label": "open the requested application",
+            "command": app_name,
+        })
 
     if "brightness" in lower:
         steps.append({
             "action": "set_brightness",
             "label": "adjust brightness",
-            "level": 50,
+            "level": parse_numeric_level(prompt, 50),
         })
 
     if "volume" in lower:
         steps.append({
             "action": "set_volume",
             "label": "adjust volume",
-            "level": 50,
+            "level": parse_numeric_level(prompt, 50),
+        })
+
+    if "website" in lower or "url" in lower or "go to " in lower:
+        steps.append({
+            "action": "open_url",
+            "label": "open the requested website",
+            "url": "",
         })
 
     if not steps:
@@ -781,6 +875,40 @@ def parse_and_act(ai_response):
 def handle_agentic_prompt(user_input, memory_data):
     """Adds lightweight agentic behavior without changing the original command flow."""
     lower = user_input.lower()
+
+    direct_task = parse_direct_task(user_input)
+    if direct_task:
+        action = direct_task["action"]
+        if action == "open_app":
+            execute_system_command(direct_task["command"])
+            return f"Opening {direct_task['command']}."
+        if action == "set_brightness":
+            set_screen_brightness(direct_task["level"])
+            return f"Brightness set to {direct_task['level']}%."
+        if action == "set_volume":
+            set_system_volume(direct_task["level"])
+            return f"Volume set to {direct_task['level']}%."
+        if action == "search_files":
+            query = direct_task["query"]
+            hits = search_local_files(query)
+            if hits:
+                return f"I found {len(hits)} local match(es): " + "; ".join(hits[:3])
+            return f"I searched for '{query}' and found no local matches."
+        if action == "read_file":
+            path = direct_task["path"]
+            content = read_text_file(path)
+            return f"Reading {path}\n{content[:400]}" if isinstance(content, str) else content
+        if action == "write_file":
+            path = direct_task["path"]
+            content = direct_task["content"]
+            ok = write_text_file(path, content)
+            return f"Wrote {path}." if ok else f"Failed to write {path}."
+        if action == "list_dir":
+            items = list_directory(direct_task["path"])
+            return f"Directory listing for {direct_task['path']}: " + ", ".join(items[:10]) if items else "No items found."
+        if action == "open_url":
+            browser_open_url(direct_task["url"])
+            return f"Opening {direct_task['url']} in the default browser."
 
     # Quick local file creation shortcut: handle simple "create file" requests
     if any(kw in lower for kw in ("create file", "create a file", "make a file", "write file", "create file named", "create file called")):
