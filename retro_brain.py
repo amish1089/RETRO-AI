@@ -194,7 +194,13 @@ def recognize_multi_step_task(prompt):
         " browse ", " go to "
     ]
     lower = prompt.lower()
-    return any(marker in lower for marker in task_markers) and len(prompt.split()) > 3
+    if any(marker in lower for marker in task_markers) and len(prompt.split()) > 3:
+        return True
+
+    # Small compatibility add-on for chained commands like 'find X then read it'.
+    if re.search(r"\b(?:search|find|look for|locate|read|open|write|create)\b.*\b(?:and|then)\b.*\b(?:search|find|look for|locate|read|open|write|create)\b", lower):
+        return True
+    return False
 
 
 def extract_app_name(prompt):
@@ -242,9 +248,15 @@ def parse_direct_task(prompt):
     user_text = (prompt or "").strip()
     lower = user_text.lower()
 
+    url_direct = re.search(r"\b(?:https?://|www\.)[A-Za-z0-9.-]+\.[A-Za-z]{2,}\S*\b", user_text, re.IGNORECASE)
+    if url_direct and re.match(r"^(open|launch|start|run)\b", lower):
+        return {"action": "open_url", "url": url_direct.group(0)}
+
     if re.match(r"^(open|launch|start|run)\b", lower):
         app_name = extract_app_name(user_text)
         if app_name:
+            if app_name in ["https", "http"]:
+                return {"action": "open_url", "url": user_text.split(None, 1)[1].strip() if len(user_text.split(None, 1)) > 1 else ""}
             return {"action": "open_app", "command": app_name}
 
     if any(term in lower for term in ["set brightness", "brightness", "screen brightness"]):
@@ -253,6 +265,16 @@ def parse_direct_task(prompt):
     if any(term in lower for term in ["set volume", "volume", "sound level"]):
         return {"action": "set_volume", "level": parse_numeric_level(user_text, 50)}
 
+    search_match = re.search(
+        r"(?:can\s+you\s+)?(?:please\s+)?(?:search|find|look\s+for|locate)\s+(?:for\s+)?(.+?)(?:\s+(?:for\s+me|for\s+us|please)|$|[?!.]|,|\band\b)",
+        user_text,
+        re.IGNORECASE
+    )
+    if search_match:
+        query = search_match.group(1).strip().strip('"\'')
+        if query and len(query.split()) <= 12:
+            return {"action": "search_files", "query": query}
+
     if any(term in lower for term in ["search for ", "find ", "look for ", "locate "]):
         return {"action": "search_files", "query": extract_search_query(user_text)}
 
@@ -260,6 +282,10 @@ def parse_direct_task(prompt):
         match = re.search(r"(?:read|open|view)\s+(?:the\s+)?(?:file\s+)?(.+)", user_text, re.IGNORECASE)
         if match:
             return {"action": "read_file", "path": match.group(1).strip().strip('"\'')}
+
+    read_file_match = re.search(r"(?:read|open|view)\s+(?:the\s+)?([\w\- ./\\]+\.[A-Za-z0-9]+)", user_text, re.IGNORECASE)
+    if read_file_match:
+        return {"action": "read_file", "path": read_file_match.group(1).strip().strip('"\'')}
 
     if any(term in lower for term in ["write file ", "create file ", "make file "]):
         match = re.search(r"(?:write|create|make)\s+(?:the\s+)?(?:file\s+)?(?:named\s+)?([\w\- ./]+\.[a-zA-Z0-9]+)\s*(?:with\s+|to\s+)?(.+)?", user_text, re.IGNORECASE)
@@ -278,37 +304,55 @@ def parse_direct_task(prompt):
         if match:
             return {"action": "open_url", "url": match.group(1)}
 
+    url_match = re.search(r"\b(?:https?://|www\.)[A-Za-z0-9.-]+\.[A-Za-z]{2,}\S*\b", user_text, re.IGNORECASE)
+    if url_match:
+        return {"action": "open_url", "url": url_match.group(0)}
+
     return None
 
 
 def extract_search_query(prompt):
-    """Extracts a useful search string from a task prompt, dropping trailing instructions."""
-    lower = prompt.lower()
+    """Extracts the main subject from a natural-language search request."""
+    text = (prompt or "").strip()
+    lower = text.lower()
+
+    patterns = [
+        r"(?:can\s+you\s+)?(?:please\s+)?(?:search|find|look\s+for|locate)\s+(?:for\s+)?(.+?)(?:\s+(?:for\s+me|for\s+us|please)|$|[?!.]|,|\band\b)",
+        r"(?:search\s+for|find|look\s+for|locate)\s+(.+?)(?:\s+(?:for\s+me|for\s+us|please)|$|[?!.]|,|\band\b)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            query = match.group(1).strip().strip('"\'')
+            if query:
+                return query
+
     for marker in ["search for ", "find ", "look for ", "locate "]:
         idx = lower.find(marker)
         if idx != -1:
-            remainder = prompt[idx + len(marker):]
-            lower_remainder = lower[idx + len(marker):]
-            # Strip extra chain commands to avoid failing search
+            remainder = text[idx + len(marker):]
             for splitter in [" and ", " then ", " to "]:
-                if splitter in lower_remainder:
-                    split_idx = lower_remainder.find(splitter)
+                if splitter in remainder.lower():
+                    split_idx = remainder.lower().find(splitter)
                     remainder = remainder[:split_idx]
-                    lower_remainder = lower_remainder[:split_idx]
+                    break
             return remainder.strip(" .?")
 
     if "about" in lower:
         idx = lower.find("about ") + len("about ")
-        remainder = prompt[idx:]
-        lower_remainder = lower[idx:]
+        remainder = text[idx:]
         for splitter in [" and ", " then ", " to "]:
-            if splitter in lower_remainder:
-                split_idx = lower_remainder.find(splitter)
+            if splitter in remainder.lower():
+                split_idx = remainder.lower().find(splitter)
                 remainder = remainder[:split_idx]
-                lower_remainder = lower_remainder[:split_idx]
+                break
         return remainder.strip(" .?")
 
-    return prompt.strip(" .? ")
+    if re.search(r"\b(?:search|find|look for|locate)\b", lower):
+        return text
+
+    return text.strip(" .? ")
 
 
 def plan_task(prompt):
@@ -372,6 +416,10 @@ def plan_task(prompt):
             "label": "open the requested website",
             "url": "",
         })
+
+    if re.search(r"\b(?:search|find|look for|locate|read|open|write|create)\b.*\b(?:and|then)\b.*\b(?:search|find|look for|locate|read|open|write|create)\b", lower):
+        if not steps:
+            steps.append({"action": "respond", "label": "handle the user request with the main agent flow"})
 
     if not steps:
         steps = [{"action": "respond", "label": "handle the user request with the main agent flow"}]
