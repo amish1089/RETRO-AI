@@ -193,21 +193,36 @@ def recognize_multi_step_task(prompt):
         " look for ", " before ", " after that "
     ]
     lower = prompt.lower()
-    return any(marker in lower for marker in task_markers) and len(prompt.split()) > 8
+    # Changed from > 8 to > 3 to allow shorter, direct agentic commands
+    return any(marker in lower for marker in task_markers) and len(prompt.split()) > 3
 
 
 def extract_search_query(prompt):
-    """Extracts a useful search string from a task prompt."""
+    """Extracts a useful search string from a task prompt, dropping trailing instructions."""
     lower = prompt.lower()
     for marker in ["search for ", "find ", "look for ", "locate "]:
         idx = lower.find(marker)
         if idx != -1:
             remainder = prompt[idx + len(marker):]
+            lower_remainder = lower[idx + len(marker):]
+            # Strip extra chain commands to avoid failing search
+            for splitter in [" and ", " then ", " to "]:
+                if splitter in lower_remainder:
+                    split_idx = lower_remainder.find(splitter)
+                    remainder = remainder[:split_idx]
+                    lower_remainder = lower_remainder[:split_idx]
             return remainder.strip(" .?")
 
     if "about" in lower:
         idx = lower.find("about ") + len("about ")
-        return prompt[idx:].strip(" .?")
+        remainder = prompt[idx:]
+        lower_remainder = lower[idx:]
+        for splitter in [" and ", " then ", " to "]:
+            if splitter in lower_remainder:
+                split_idx = lower_remainder.find(splitter)
+                remainder = remainder[:split_idx]
+                lower_remainder = lower_remainder[:split_idx]
+        return remainder.strip(" .?")
 
     return prompt.strip(" .? ")
 
@@ -477,11 +492,23 @@ def read_text_file(path):
 def write_text_file(path, content):
     """Writes a text file safely."""
     try:
+        # Debug info to help diagnose OneDrive/permission issues
+        print(f"[DEBUG WRITE] target={path} cwd={os.getcwd()}")
+        parent = os.path.dirname(path)
+        if parent and not os.path.exists(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except Exception as e:
+                print(f"[DEBUG WRITE] failed to create parent dir: {e}")
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
         return True
     except Exception as e:
         print(f"[ERROR]: Could not write file: {e}")
+        try:
+            print(f"[ERROR DEBUG] parent_exists={os.path.exists(os.path.dirname(path))}")
+        except Exception:
+            pass
         return False
 
 
@@ -701,62 +728,87 @@ def ask_retro(prompt, context=None):
 # ==========================================
 def parse_and_act(ai_response):
     """Looks for <CMD> tags, executes them, and cleans the text for the user."""
+    clean_text = ai_response
+
     # 1. Brightness command
-    bright_match = re.search(r"<CMD>BRIGHTNESS:(\d+)</CMD>", ai_response, re.IGNORECASE)
-    if bright_match:
-        set_screen_brightness(bright_match.group(1))
-        return re.sub(r"<CMD>BRIGHTNESS:.*?</CMD>", "", ai_response, flags=re.IGNORECASE).strip()
+    for match in re.finditer(r"<CMD>BRIGHTNESS:(\d+)</CMD>", clean_text, re.IGNORECASE):
+        set_screen_brightness(match.group(1))
+    clean_text = re.sub(r"<CMD>BRIGHTNESS:.*?</CMD>", "", clean_text, flags=re.IGNORECASE)
 
     # 2. Volume command
-    vol_match = re.search(r"<CMD>VOLUME:(\d+)</CMD>", ai_response, re.IGNORECASE)
-    if vol_match:
-        set_system_volume(vol_match.group(1))
-        return re.sub(r"<CMD>VOLUME:.*?</CMD>", "", ai_response, flags=re.IGNORECASE).strip()
+    for match in re.finditer(r"<CMD>VOLUME:(\d+)</CMD>", clean_text, re.IGNORECASE):
+        set_system_volume(match.group(1))
+    clean_text = re.sub(r"<CMD>VOLUME:.*?</CMD>", "", clean_text, flags=re.IGNORECASE)
 
     # 3. Search command
-    search_match = re.search(r"<CMD>SEARCH:(.*?)</CMD>", ai_response, re.IGNORECASE)
-    if search_match:
-        search_local_files(search_match.group(1))
-        return re.sub(r"<CMD>SEARCH:.*?</CMD>", "", ai_response, flags=re.IGNORECASE).strip()
+    for match in re.finditer(r"<CMD>SEARCH:(.*?)</CMD>", clean_text, re.IGNORECASE):
+        search_local_files(match.group(1).strip())
+    clean_text = re.sub(r"<CMD>SEARCH:.*?</CMD>", "", clean_text, flags=re.IGNORECASE)
 
     # 4. Read file
-    read_file_match = re.search(r"<CMD>READ_FILE:(.*?)</CMD>", ai_response, re.IGNORECASE)
-    if read_file_match:
-        file_path = read_file_match.group(1).strip()
+    for match in re.finditer(r"<CMD>READ_FILE:(.*?)</CMD>", clean_text, re.IGNORECASE):
+        file_path = match.group(1).strip()
         content = read_text_file(file_path)
         print(f"\n[RETRO FILE READ]: {file_path}\n{content[:500]}")
-        return re.sub(r"<CMD>READ_FILE:.*?</CMD>", "", ai_response, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r"<CMD>READ_FILE:.*?</CMD>", "", clean_text, flags=re.IGNORECASE)
 
     # 5. Write file
-    write_file_match = re.search(r"<CMD>WRITE_FILE:(.*?)\|(.*?)</CMD>", ai_response, re.IGNORECASE | re.DOTALL)
-    if write_file_match:
-        file_path = write_file_match.group(1).strip()
-        content = write_file_match.group(2)
+    for match in re.finditer(r"<CMD>WRITE_FILE:(.*?)\|(.*?)</CMD>", clean_text, re.IGNORECASE | re.DOTALL):
+        file_path = match.group(1).strip()
+        content = match.group(2)
         result = write_text_file(file_path, content)
         if result:
             print(f"\n[RETRO FILE WRITE]: Wrote to {file_path}")
-        return re.sub(r"<CMD>WRITE_FILE:.*?</CMD>", "", ai_response, flags=re.IGNORECASE | re.DOTALL).strip()
+    clean_text = re.sub(r"<CMD>WRITE_FILE:.*?</CMD>", "", clean_text, flags=re.IGNORECASE | re.DOTALL)
 
     # 6. List directory
-    list_dir_match = re.search(r"<CMD>LIST_DIR:(.*?)</CMD>", ai_response, re.IGNORECASE)
-    if list_dir_match:
-        directory = list_dir_match.group(1).strip()
+    for match in re.finditer(r"<CMD>LIST_DIR:(.*?)</CMD>", clean_text, re.IGNORECASE):
+        directory = match.group(1).strip()
         items = list_directory(directory)
         print(f"\n[RETRO DIR LIST]: {directory}\n{items}")
-        return re.sub(r"<CMD>LIST_DIR:.*?</CMD>", "", ai_response, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r"<CMD>LIST_DIR:.*?</CMD>", "", clean_text, flags=re.IGNORECASE)
 
-    # 7. Standard app execution remains in place
-    commands = re.findall(r"<CMD>(.*?)</CMD>", ai_response, re.IGNORECASE | re.DOTALL)
+    # 7. Standard app execution
+    commands = re.findall(r"<CMD>(.*?)</CMD>", clean_text, re.IGNORECASE | re.DOTALL)
     for cmd in commands:
         execute_system_command(cmd)
 
-    clean_text = re.sub(r"<CMD>.*?</CMD>", "", ai_response, flags=re.IGNORECASE | re.DOTALL).strip()
+    # Final cleanup of any executed tags
+    clean_text = re.sub(r"<CMD>.*?</CMD>", "", clean_text, flags=re.IGNORECASE | re.DOTALL).strip()
     return clean_text
 
 
 def handle_agentic_prompt(user_input, memory_data):
     """Adds lightweight agentic behavior without changing the original command flow."""
     lower = user_input.lower()
+
+    # Quick local file creation shortcut: handle simple "create file" requests
+    if any(kw in lower for kw in ("create file", "create a file", "make a file", "write file", "create file named", "create file called")):
+        # try to extract a filename from the user input
+        m = re.search(r'file(?: named| called)?\s+["\']?([^"\'\n]+)["\']?', user_input, re.IGNORECASE)
+        if not m:
+            m = re.search(r"([\w\- ./]+\.[a-zA-Z0-9]+)", user_input)
+        if m:
+            filename = m.group(1).strip()
+            # Normalize to absolute path to avoid cwd/OneDrive ambiguity
+            if os.path.isabs(filename):
+                target = os.path.normpath(filename)
+            else:
+                target = os.path.normpath(os.path.abspath(filename))
+            try:
+                parent = os.path.dirname(target)
+                if parent and not os.path.exists(parent):
+                    os.makedirs(parent, exist_ok=True)
+                ok = write_text_file(target, "")
+                if ok:
+                    remember_history(memory_data, user_input)
+                    return f"Created file: {target}"
+                else:
+                    return f"Failed to create file: {target}"
+            except Exception as e:
+                return f"Error creating file: {e}"
+        else:
+            return "Please specify the file name to create."
 
     if "remember" in lower or "prefer" in lower:
         if " prefer " in lower or " prefer" in lower:

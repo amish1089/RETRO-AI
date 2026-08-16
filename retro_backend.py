@@ -108,6 +108,12 @@ def chat(request: ChatRequest) -> dict[str, Any]:
     if not message:
         return {"reply": "Please enter a message for Retro.", "context": None, "model": retro_brain.MODEL}
 
+    # If the user directly includes command tags, execute them immediately
+    if "<CMD>" in message and "</CMD>" in message:
+        # parse_and_act will execute writable commands like WRITE_FILE
+        cleaned = retro_brain.parse_and_act(message)
+        return {"reply": cleaned or "Command executed.", "context": None, "model": retro_brain.MODEL}
+
     memory_data = retro_brain.load_memory()
     agentic_reply = retro_brain.handle_agentic_prompt(message, memory_data)
     if agentic_reply:
