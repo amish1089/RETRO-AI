@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import retro_brain
 
@@ -22,12 +22,7 @@ class QueueRequest(BaseModel):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-    ],
+    allow_origins=[origin.strip() for origin in os.getenv("RETRO_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001").split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,7 +30,7 @@ app.add_middleware(
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=4000)
     context: list[int] | None = None
 
 
@@ -108,11 +103,10 @@ def chat(request: ChatRequest) -> dict[str, Any]:
     if not message:
         return {"reply": "Please enter a message for Retro.", "context": None, "model": retro_brain.MODEL}
 
-    # If the user directly includes command tags, execute them immediately
-    if "<CMD>" in message and "</CMD>" in message:
-        # parse_and_act will execute writable commands like WRITE_FILE
-        cleaned = retro_brain.parse_and_act(message)
-        return {"reply": cleaned or "Command executed.", "context": None, "model": retro_brain.MODEL}
+    # Direct command tags are never executed from browser input. They must be
+    # produced by the agent flow and remain subject to the brain's allowlist.
+    if "<CMD>" in message or "</CMD>" in message:
+        raise HTTPException(status_code=400, detail="Direct command tags are not accepted from clients.")
 
     memory_data = retro_brain.load_memory()
     agentic_reply = retro_brain.handle_agentic_prompt(message, memory_data)
